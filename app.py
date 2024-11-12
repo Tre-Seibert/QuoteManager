@@ -3,17 +3,16 @@ import time
 from exchangelib import OAuth2Credentials, Configuration, Account, IMPERSONATION
 import msal
 import os
+import logging
 from dotenv import load_dotenv
 from oauthlib.oauth2 import OAuth2Token 
 from exchangelib.version import Version, EXCHANGE_O365
+from exchangelib.errors import RateLimitError, ErrorItemNotFound, ErrorServerBusy, ErrorMailboxMoveInProgress, ErrorTimeoutExpired, ErrorTooManyObjectsOpened
 
 # Load environment variables from .env file
 load_dotenv()
 
 # Authentication
-
-# Token refresh interval in seconds (1 hour)
-TOKEN_REFRESH_INTERVAL = 60 * 60
 
 
 # Set up MSAL client 
@@ -197,70 +196,124 @@ def get_all_quotes(api_key, quote_number="", modified_after=None, page=1, page_s
     return all_quotes
 
 
-def monitor_inbox(api_key, account, app, credentials, check_interval=5):
+# Configure logging
+logging.basicConfig(
+    filename="quotemon.log",
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+)
+
+def monitor_inbox(api_key, account, app, credentials, check_interval):
     api_key = api_key
 
     # Get all quotes
-    all_quotes = get_all_quotes(api_key)
-    print(f"Retrieved {len(all_quotes)}")
+    try:
+        all_quotes = get_all_quotes(api_key)
+        logging.info(f"Retrieved {len(all_quotes)} quotes.")
+    except Exception as e:
+        logging.error(f"Error fetching quotes: {e}")
+        all_quotes = []
 
     # Access "Processed Quotes" folder
-    processed_quotes_folder = account.root // \
-        "Top of Information Store" // "Processed Quotes"
+    try:
+        processed_quotes_folder = account.root // "Top of Information Store" // "Processed Quotes"
+    except Exception as e:
+        logging.error(f"Error accessing 'Processed Quotes' folder: {e}")
+        return  # Exit if we cannot access the folder
 
     while True:
-        print("Checking for new approved emails...")
+        logging.info("Checking for new approved emails...")
+        
+        try:
+            # Refresh the token to ensure it is valid
+            access_token = acquire_token(app)
 
-        # Refresh the token to ensure it is valid
-        access_token = acquire_token(app)
+            # Reinitialize credentials with the new token
+            new_credentials = OAuth2Credentials(
+                client_id=credentials.client_id,
+                client_secret=credentials.client_secret,
+                tenant_id=credentials.tenant_id,
+                identity=None,
+                access_token=access_token,
+            )
 
-        # Reinitialize credentials with the new token
-        new_credentials = OAuth2Credentials(
-            client_id=credentials.client_id,
-            client_secret=credentials.client_secret,
-            tenant_id=credentials.tenant_id,
-            identity=None,
-            access_token=access_token
-        )
+            # Recreate account object with new credentials
+            config = Configuration(
+                server="outlook.office365.com",
+                credentials=new_credentials,
+                version=Version(build=EXCHANGE_O365),
+            )
+            account = Account(
+                primary_smtp_address=account.primary_smtp_address,
+                config=config,
+                autodiscover=False,
+                access_type=IMPERSONATION,
+            )
 
-        # Recreate account object with new credentials
-        config = Configuration(
-            server="outlook.office365.com",
-            credentials=new_credentials,
-            version=Version(build=EXCHANGE_O365)
-        )
-        account = Account(primary_smtp_address=account.primary_smtp_address,
-                          config=config, autodiscover=False, access_type=IMPERSONATION)
+            # Pull up to 1000 emails ordered by datetime received
+            for item in account.inbox.all().order_by("-datetime_received")[:1000]:
+                try:
+                    if "has been signed by " in item.subject:
+                        title = item.subject.split(" has been signed by ")[0]
+                        logging.info(f"Email found with title: {title}")
 
-        # Pull up to 1000 emails ordered by datetime received
-        for item in account.inbox.all().order_by("-datetime_received")[:1000]:
-            if "has been signed by " in item.subject:
-                title = item.subject.split(" has been signed by ")[0]
-                print(f"Email found with title: {title}")
-                all_quotes = get_all_quotes(api_key)
-                for quote in all_quotes:
-                    if quote['title'] == title:
-                        print("Title found in list of titles")
-                        quoteId = quote['id']
-                        quote_details = get_quote_details(quoteId, api_key)
+                        # Fetch all quotes again to ensure fresh data
+                        all_quotes = get_all_quotes(api_key)
+                        
+                        for quote in all_quotes:
+                            if quote['title'] == title:
+                                logging.info("Title found in list of titles.")
+                                quoteId = quote['id']
+                                quote_details = get_quote_details(quoteId, api_key)
 
-                        if quote_details:
-                            sales_order_id = quote_details.get('salesOrderId')
+                                if quote_details:
+                                    sales_order_id = quote_details.get('salesOrderId')
 
-                            if sales_order_id:
-                                sales_order_lines = get_sales_order_lines(
-                                    sales_order_id, api_key)
+                                    if sales_order_id:
+                                        sales_order_lines = get_sales_order_lines(sales_order_id, api_key)
 
-                                if sales_order_lines:
-                                    total_amount = calc_total(
-                                        quote_details, sales_order_lines)
-                                    print(f"The total amount for quote {quoteId} is: ${total_amount:.2f}")
-                                    print(f"Moving email: {item.subject}")
-                                    item.move(processed_quotes_folder)
-                                    print(f"Email moved to: {processed_quotes_folder.name}")
+                                        if sales_order_lines:
+                                            total_amount = calc_total(quote_details, sales_order_lines)
+                                            logging.info(f"The total amount for quote {quoteId} is: ${total_amount:.2f}")
+                                            logging.info(f"Moving email: {item.subject}")
+                                            retry_with_backoff(
+                                                lambda: item.move(processed_quotes_folder),
+                                                operation_description=f"Moving email {item.subject}"
+                                            )
+                                            logging.info(f"Email moved to: {processed_quotes_folder.name}")
+                except Exception as e:
+                    logging.error(f"Error processing email '{item.subject}': {e}")
+
+        except Exception as e:
+            logging.error(f"Error during email monitoring: {e}")
 
         # Wait for the specified interval before checking again
+        logging.info(f"Sleeping for {check_interval} seconds before the next check.")
         time.sleep(check_interval)
+
+
+def retry_with_backoff(func, operation_description, max_retries=5, base_delay=5):
+    """
+    Retry a function with exponential backoff on exceptions.
+
+    :param func: Function to execute
+    :param operation_description: Description of the operation for logging
+    :param max_retries: Maximum number of retries
+    :param base_delay: Initial delay between retries
+    """
+    delay = base_delay
+    for attempt in range(max_retries):
+        try:
+            func()
+            return  # Exit the retry loop on success
+        except (RateLimitError, ErrorItemNotFound, ErrorServerBusy, ErrorTimeoutExpired, ErrorMailboxMoveInProgress, ErrorTooManyObjectsOpened) as e:
+            logging.warning(f"Retryable error during {operation_description}: {e}. Retrying in {delay} seconds...")
+            time.sleep(delay)
+            delay *= 2  # Double the delay for exponential backoff
+        except Exception as e:
+            logging.error(f"Non-retryable error during {operation_description}: {e}")
+            break
+    logging.error(f"Failed {operation_description} after {max_retries} retries.")
 
 
 # Main Function
@@ -270,4 +323,4 @@ if __name__ == "__main__":
     account, app, credentials = initialize()
 
     # Start monitoring the inbox
-    monitor_inbox(api_key, account, app, credentials, check_interval=5)
+    monitor_inbox(api_key, account, app, credentials, check_interval=600)
