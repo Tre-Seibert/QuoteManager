@@ -1,0 +1,8 @@
+requests
+exchangelib
+msal
+python-dotenv
+oauthlib
+time
+dotenv
+os

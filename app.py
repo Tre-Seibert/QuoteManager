@@ -2,7 +2,6 @@ import requests
 import time
 from exchangelib import OAuth2Credentials, Configuration, Account, IMPERSONATION
 import msal
-import threading
 import os
 from dotenv import load_dotenv
 from oauthlib.oauth2 import OAuth2Token 
